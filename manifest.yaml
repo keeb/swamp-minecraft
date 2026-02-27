@@ -1,0 +1,17 @@
+manifestVersion: 1
+name: "@keeb/minecraft"
+version: "2026.02.27.1"
+description: "Minecraft server control + installer + metrics collection"
+models:
+  - minecraft_server.ts
+  - minecraft_installer.ts
+workflows:
+  - start-minecraft/workflow.yaml
+  - stop-minecraft/workflow.yaml
+  - reboot-minecraft/workflow.yaml
+  - status-minecraft/workflow.yaml
+  - minecraft-install/workflow.yaml
+  - collect-game-metrics/workflow.yaml
+dependencies:
+  - "@keeb/proxmox"
+  - "@keeb/prometheus"
