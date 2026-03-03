@@ -1,9 +1,9 @@
 manifestVersion: 1
 name: "@keeb/minecraft"
-version: "2026.03.02.2"
+version: "2026.03.02.3"
 description: "Minecraft server control + installer + metrics collection (https://github.com/keeb/swamp-minecraft)"
 repository: https://github.com/keeb/swamp-minecraft
-tags:
+labels:
   - minecraft
   - gaming
   - server
