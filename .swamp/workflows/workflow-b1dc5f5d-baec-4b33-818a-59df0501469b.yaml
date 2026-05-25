@@ -1,5 +1,5 @@
 id: b1dc5f5d-baec-4b33-818a-59df0501469b
-name: status-minecraft
+name: '@keeb/status-minecraft'
 description: Check Minecraft server status by VM name
 inputs:
   properties:

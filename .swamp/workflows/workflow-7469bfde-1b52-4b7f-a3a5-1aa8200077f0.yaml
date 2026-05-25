@@ -1,5 +1,5 @@
 id: 7469bfde-1b52-4b7f-a3a5-1aa8200077f0
-name: minecraft-install
+name: '@keeb/minecraft-install'
 description: Install and start a Minecraft server from a server pack zip on any VM
 inputs:
   vmName:

@@ -1,5 +1,10 @@
+/**
+ * @keeb/minecraft/installer model — install a Minecraft server from a
+ * server-pack zip on a remote Alpine VM: install deps (JDK, tmux), upload
+ * the pack, extract + discover the start script, and configure EULA + JVM.
+ */
 import { z } from "npm:zod@4";
-import { sshExec, sshExecRaw, isValidSshHost, waitForSsh } from "./lib/ssh.ts";
+import { isValidSshHost, sshExec, sshExecRaw, waitForSsh } from "./lib/ssh.ts";
 
 const GlobalArgs = z.object({
   sshHost: z.string().describe("SSH hostname/IP (set via CEL from fleet)"),
@@ -34,8 +39,15 @@ const ConfigSchema = z.object({
   timestamp: z.string(),
 });
 
-export const model = {
-  type: "@user/minecraft/installer",
+/** Swamp model definition for `@keeb/minecraft/installer`. */
+export const model: {
+  type: string;
+  version: string;
+  resources: Record<string, unknown>;
+  globalArguments: typeof GlobalArgs;
+  methods: Record<string, unknown>;
+} = {
+  type: "@keeb/minecraft/installer",
   version: "2026.02.16.1",
   resources: {
     "deps": {
@@ -66,24 +78,33 @@ export const model = {
   globalArguments: GlobalArgs,
   methods: {
     installDeps: {
-      description: "Install required packages (JDK, tmux, bash, curl, unzip) on the VM",
+      description:
+        "Install required packages (JDK, tmux, bash, curl, unzip) on the VM",
       arguments: z.object({
         vmName: z.string().describe("VM name (used as resource instance name)"),
       }),
       execute: async (args, context) => {
         const { vmName } = args;
         const { sshHost, sshUser = "root" } = context.globalArgs;
-        if (!isValidSshHost(sshHost)) throw new Error("sshHost is required - is the VM running?");
+        if (!isValidSshHost(sshHost)) {
+          throw new Error("sshHost is required - is the VM running?");
+        }
 
         console.log(`[installDeps] Waiting for SSH on ${sshHost}...`);
         const ready = await waitForSsh(sshHost, sshUser);
-        if (!ready) throw new Error(`SSH not reachable on ${sshHost} after 60s`);
+        if (!ready) {
+          throw new Error(`SSH not reachable on ${sshHost} after 60s`);
+        }
 
         const packages = "openjdk21-jre tmux bash curl unzip";
         console.log(`[installDeps] Installing packages: ${packages}`);
         await sshExec(sshHost, sshUser, `apk add ${packages}`);
 
-        const javaResult = await sshExecRaw(sshHost, sshUser, "java -version 2>&1 | head -1");
+        const javaResult = await sshExecRaw(
+          sshHost,
+          sshUser,
+          "java -version 2>&1 | head -1",
+        );
         const javaVersion = javaResult.stdout.trim();
         console.log(`[installDeps] Java version: ${javaVersion}`);
 
@@ -105,16 +126,21 @@ export const model = {
       execute: async (args, context) => {
         const { vmName, localPath } = args;
         const { sshHost, sshUser = "root" } = context.globalArgs;
-        if (!isValidSshHost(sshHost)) throw new Error("sshHost is required - is the VM running?");
+        if (!isValidSshHost(sshHost)) {
+          throw new Error("sshHost is required - is the VM running?");
+        }
 
         const remotePath = "~/server-pack.zip";
-        console.log(`[upload] Uploading ${localPath} to ${sshUser}@${sshHost}:${remotePath}`);
+        console.log(
+          `[upload] Uploading ${localPath} to ${sshUser}@${sshHost}:${remotePath}`,
+        );
 
         // @ts-ignore - Deno API
         const rsync = new Deno.Command("rsync", {
           args: [
             "-avz",
-            "-e", "ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10",
+            "-e",
+            "ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10",
             localPath,
             `${sshUser}@${sshHost}:${remotePath}`,
           ],
@@ -136,26 +162,39 @@ export const model = {
     },
 
     extract: {
-      description: "Extract server pack zip, discover modloader config and start script",
+      description:
+        "Extract server pack zip, discover modloader config and start script",
       arguments: z.object({
         vmName: z.string().describe("VM name (used as resource instance name)"),
         remotePath: z.string().describe("Remote path to the server pack zip"),
-        serverDir: z.string().default("~/game").describe("Directory to extract into"),
+        serverDir: z.string().default("~/game").describe(
+          "Directory to extract into",
+        ),
       }),
       execute: async (args, context) => {
         const { vmName, remotePath, serverDir } = args;
         const { sshHost, sshUser = "root" } = context.globalArgs;
-        if (!isValidSshHost(sshHost)) throw new Error("sshHost is required - is the VM running?");
+        if (!isValidSshHost(sshHost)) {
+          throw new Error("sshHost is required - is the VM running?");
+        }
 
         console.log(`[extract] Extracting ${remotePath} to ${serverDir}`);
         await sshExec(sshHost, sshUser, `mkdir -p ${serverDir}`);
-        await sshExec(sshHost, sshUser, `cd ${serverDir} && unzip -o ${remotePath}`);
+        await sshExec(
+          sshHost,
+          sshUser,
+          `cd ${serverDir} && unzip -o ${remotePath}`,
+        );
 
         // Parse variables.txt if present
         let modloader = "";
         let mcVersion = "";
         let modloaderVersion = "";
-        const varsResult = await sshExecRaw(sshHost, sshUser, `cat ${serverDir}/variables.txt 2>/dev/null || echo ""`);
+        const varsResult = await sshExecRaw(
+          sshHost,
+          sshUser,
+          `cat ${serverDir}/variables.txt 2>/dev/null || echo ""`,
+        );
         if (varsResult.stdout.trim()) {
           const vars = varsResult.stdout;
           const mlMatch = vars.match(/MODLOADER=(\S+)/);
@@ -164,17 +203,25 @@ export const model = {
           if (mlMatch) modloader = mlMatch[1];
           if (mcMatch) mcVersion = mcMatch[1];
           if (mlvMatch) modloaderVersion = mlvMatch[1];
-          console.log(`[extract] Discovered: modloader=${modloader} mc=${mcVersion} modloaderVersion=${modloaderVersion}`);
+          console.log(
+            `[extract] Discovered: modloader=${modloader} mc=${mcVersion} modloaderVersion=${modloaderVersion}`,
+          );
         }
 
         // Discover start script
-        const findResult = await sshExecRaw(sshHost, sshUser,
-          `cd ${serverDir} && ls -1 startserver.sh start.sh run.sh ServerStart.sh Start.sh 2>/dev/null | head -1`);
+        const findResult = await sshExecRaw(
+          sshHost,
+          sshUser,
+          `cd ${serverDir} && ls -1 startserver.sh start.sh run.sh ServerStart.sh Start.sh 2>/dev/null | head -1`,
+        );
         let startScript = findResult.stdout.trim();
         if (!startScript) {
           // Fallback: find any .sh that looks like a start script
-          const fallback = await sshExecRaw(sshHost, sshUser,
-            `cd ${serverDir} && ls -1 *.sh 2>/dev/null | head -1`);
+          const fallback = await sshExecRaw(
+            sshHost,
+            sshUser,
+            `cd ${serverDir} && ls -1 *.sh 2>/dev/null | head -1`,
+          );
           startScript = fallback.stdout.trim() || "startserver.sh";
         }
         console.log(`[extract] Start script: ${startScript}`);
@@ -204,33 +251,61 @@ export const model = {
       execute: async (args, context) => {
         const { vmName, serverDir, jvmMemory } = args;
         const { sshHost, sshUser = "root" } = context.globalArgs;
-        if (!isValidSshHost(sshHost)) throw new Error("sshHost is required - is the VM running?");
+        if (!isValidSshHost(sshHost)) {
+          throw new Error("sshHost is required - is the VM running?");
+        }
 
         console.log(`[configure] Configuring server in ${serverDir}`);
 
         // Update variables.txt if present
-        const hasVars = await sshExecRaw(sshHost, sshUser, `test -f ${serverDir}/variables.txt && echo yes || echo no`);
+        const hasVars = await sshExecRaw(
+          sshHost,
+          sshUser,
+          `test -f ${serverDir}/variables.txt && echo yes || echo no`,
+        );
         if (hasVars.stdout.trim() === "yes") {
-          console.log(`[configure] Setting JVM memory to -Xmx${jvmMemory} -Xms${jvmMemory}`);
-          await sshExec(sshHost, sshUser,
-            `cd ${serverDir} && sed -i 's/JAVA_ARGS=.*/JAVA_ARGS="-Xmx${jvmMemory} -Xms${jvmMemory}"/' variables.txt`);
+          console.log(
+            `[configure] Setting JVM memory to -Xmx${jvmMemory} -Xms${jvmMemory}`,
+          );
+          await sshExec(
+            sshHost,
+            sshUser,
+            `cd ${serverDir} && sed -i 's/JAVA_ARGS=.*/JAVA_ARGS="-Xmx${jvmMemory} -Xms${jvmMemory}"/' variables.txt`,
+          );
 
           // Set common variables for unattended operation
-          await sshExec(sshHost, sshUser,
-            `cd ${serverDir} && sed -i 's/SKIP_JAVA_CHECK=.*/SKIP_JAVA_CHECK=true/' variables.txt`);
-          await sshExec(sshHost, sshUser,
-            `cd ${serverDir} && sed -i 's/WAIT_FOR_USER_INPUT=.*/WAIT_FOR_USER_INPUT=false/' variables.txt`);
-          await sshExec(sshHost, sshUser,
-            `cd ${serverDir} && sed -i 's/RESTART=.*/RESTART=false/' variables.txt`);
+          await sshExec(
+            sshHost,
+            sshUser,
+            `cd ${serverDir} && sed -i 's/SKIP_JAVA_CHECK=.*/SKIP_JAVA_CHECK=true/' variables.txt`,
+          );
+          await sshExec(
+            sshHost,
+            sshUser,
+            `cd ${serverDir} && sed -i 's/WAIT_FOR_USER_INPUT=.*/WAIT_FOR_USER_INPUT=false/' variables.txt`,
+          );
+          await sshExec(
+            sshHost,
+            sshUser,
+            `cd ${serverDir} && sed -i 's/RESTART=.*/RESTART=false/' variables.txt`,
+          );
           console.log(`[configure] variables.txt updated`);
         }
 
         // Accept EULA
         console.log(`[configure] Accepting EULA`);
-        await sshExec(sshHost, sshUser, `echo "eula=true" > ${serverDir}/eula.txt`);
+        await sshExec(
+          sshHost,
+          sshUser,
+          `echo "eula=true" > ${serverDir}/eula.txt`,
+        );
 
         // chmod start scripts
-        await sshExecRaw(sshHost, sshUser, `chmod +x ${serverDir}/*.sh 2>/dev/null || true`);
+        await sshExecRaw(
+          sshHost,
+          sshUser,
+          `chmod +x ${serverDir}/*.sh 2>/dev/null || true`,
+        );
         console.log(`[configure] Start scripts marked executable`);
 
         // Create logs dir

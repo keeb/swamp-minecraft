@@ -43,7 +43,13 @@ export function formatLogLine(gameType, serverName, data) {
   });
 }
 
-export async function writeMetricsFiles(sshHost, sshUser, gameType, serverName, data) {
+export async function writeMetricsFiles(
+  sshHost,
+  sshUser,
+  gameType,
+  serverName,
+  data,
+) {
   const promContent = formatPromMetrics(gameType, serverName, data);
   const logLine = formatLogLine(gameType, serverName, data);
 
@@ -52,10 +58,16 @@ export async function writeMetricsFiles(sshHost, sshUser, gameType, serverName, 
   const logFile = "/var/log/game-players.log";
 
   // Atomic write: tmp → mv (prevents partial reads by node-exporter)
-  await sshExec(sshHost, sshUser,
-    `mkdir -p ${promDir} && cat > ${promFile}.tmp << 'PROMEOF'\n${promContent}PROMEOF\nmv ${promFile}.tmp ${promFile}`);
+  await sshExec(
+    sshHost,
+    sshUser,
+    `mkdir -p ${promDir} && cat > ${promFile}.tmp << 'PROMEOF'\n${promContent}PROMEOF\nmv ${promFile}.tmp ${promFile}`,
+  );
 
   // Append JSON log line (promtail picks it up)
-  await sshExec(sshHost, sshUser,
-    `echo '${logLine.replace(/'/g, "'\\''")}' >> ${logFile}`);
+  await sshExec(
+    sshHost,
+    sshUser,
+    `echo '${logLine.replace(/'/g, "'\\''")}' >> ${logFile}`,
+  );
 }

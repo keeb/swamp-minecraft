@@ -1,5 +1,5 @@
 id: 7d166515-1eb3-4128-9c64-3249bc3cd645
-name: reboot-minecraft
+name: '@keeb/reboot-minecraft'
 description: Reboot a Minecraft server by VM name
 inputs:
   properties:

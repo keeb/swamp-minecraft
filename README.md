@@ -52,6 +52,34 @@ Install a Minecraft server from a modpack zip on a remote host.
 swamp extension pull @keeb/minecraft
 ```
 
+## Example
+
+Warn players, then gracefully stop a running server before VM shutdown:
+
+```yaml
+models:
+  - name: mc
+    type: "@keeb/minecraft/server"
+    globalArguments:
+      sshHost: "10.0.0.50"
+      sshUser: "root"
+      tmuxSession: "mons"
+      serverDir: "~/mons"
+      startScript: "./startserver.sh"
+      logPath: "~/mons/logs/latest.log"
+      serverName: "mons"
+
+jobs:
+  - name: graceful-stop
+    steps:
+      - model: mc
+        method: warnShutdown
+      - model: mc
+        method: stopMinecraftServer
+      - model: mc
+        method: status
+```
+
 ## License
 
 MIT
