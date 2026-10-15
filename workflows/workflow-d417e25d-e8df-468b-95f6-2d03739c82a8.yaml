@@ -57,6 +57,17 @@ jobs:
             condition:
               type: succeeded
         weight: 0
+      - name: collect-evolution
+        description: Collect Minecraft player metrics from evolution (FTB Evolution 2)
+        task:
+          type: model_method
+          modelIdOrName: evolution-minecraft
+          methodName: collectMetrics
+        dependsOn:
+          - step: sync-fleet
+            condition:
+              type: succeeded
+        weight: 0
     dependsOn: []
     weight: 0
 version: 1

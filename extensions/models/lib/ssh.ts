@@ -52,6 +52,37 @@ export async function sshExecRaw(ip, user, command) {
   return { code: result.code, stdout, stderr };
 }
 
+export async function sshWriteFile(ip, user, remotePath, content) {
+  // @ts-ignore - Deno API
+  const proc = new Deno.Command("ssh", {
+    args: [
+      "-o",
+      "StrictHostKeyChecking=no",
+      "-o",
+      "UserKnownHostsFile=/dev/null",
+      "-o",
+      "ConnectTimeout=10",
+      `${user}@${ip}`,
+      `mkdir -p "$(dirname ${remotePath})" && cat > ${remotePath}`,
+    ],
+    stdin: "piped",
+    stdout: "piped",
+    stderr: "piped",
+  });
+  const child = proc.spawn();
+  const writer = child.stdin.getWriter();
+  await writer.write(new TextEncoder().encode(content));
+  await writer.close();
+  const result = await child.output();
+  if (result.code !== 0) {
+    throw new Error(
+      `Failed to write ${remotePath} (exit ${result.code}): ${
+        new TextDecoder().decode(result.stderr).slice(-500)
+      }`,
+    );
+  }
+}
+
 export async function waitForSsh(
   ip,
   user,

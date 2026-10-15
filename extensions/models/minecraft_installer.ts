@@ -33,6 +33,14 @@ const ServerSchema = z.object({
   timestamp: z.string(),
 });
 
+const FtbInstallSchema = z.object({
+  packId: z.string(),
+  versionId: z.string(),
+  serverDir: z.string(),
+  installerUrl: z.string(),
+  timestamp: z.string(),
+});
+
 const ConfigSchema = z.object({
   jvmMemory: z.string(),
   eulaAccepted: z.boolean(),
@@ -48,8 +56,14 @@ export const model: {
   methods: Record<string, unknown>;
 } = {
   type: "@keeb/minecraft/installer",
-  version: "2026.02.16.1",
+  version: "2026.10.11.1",
   resources: {
+    "ftbInstall": {
+      description: "FTB server installer result (pack/version installed)",
+      schema: FtbInstallSchema,
+      lifetime: "infinite",
+      garbageCollection: 5,
+    },
     "deps": {
       description: "Package install result",
       schema: DepsSchema,
@@ -82,9 +96,12 @@ export const model: {
         "Install required packages (JDK, tmux, bash, curl, unzip) on the VM",
       arguments: z.object({
         vmName: z.string().describe("VM name (used as resource instance name)"),
+        javaPackage: z.string().default("openjdk21-jre").describe(
+          "Alpine JRE package (e.g. openjdk25-jre for MC 26.x packs)",
+        ),
       }),
       execute: async (args, context) => {
-        const { vmName } = args;
+        const { vmName, javaPackage = "openjdk21-jre" } = args;
         const { sshHost, sshUser = "root" } = context.globalArgs;
         if (!isValidSshHost(sshHost)) {
           throw new Error("sshHost is required - is the VM running?");
@@ -96,7 +113,7 @@ export const model: {
           throw new Error(`SSH not reachable on ${sshHost} after 60s`);
         }
 
-        const packages = "openjdk21-jre tmux bash curl unzip";
+        const packages = `${javaPackage} tmux bash curl unzip`;
         console.log(`[installDeps] Installing packages: ${packages}`);
         await sshExec(sshHost, sshUser, `apk add ${packages}`);
 
@@ -241,6 +258,72 @@ export const model: {
       },
     },
 
+    installFtb: {
+      description:
+        "Install an FTB modpack server via FTB's server installer (for packs that don't publish a server zip), using system Java",
+      arguments: z.object({
+        vmName: z.string().describe("VM name (used as resource instance name)"),
+        packId: z.string().default("").describe("FTB modpack ID (required)"),
+        versionId: z.string().default("").describe(
+          "FTB version ID (empty = latest release)",
+        ),
+        serverDir: z.string().default("~/game").describe(
+          "Directory to install into",
+        ),
+      }),
+      execute: async (args, context) => {
+        const { vmName, packId, versionId, serverDir = "~/game" } = args;
+        const { sshHost, sshUser = "root" } = context.globalArgs;
+        if (!isValidSshHost(sshHost)) {
+          throw new Error("sshHost is required - is the VM running?");
+        }
+        if (!packId) throw new Error("packId is required");
+
+        // The installer binary is pack-agnostic; the version-pinned URL just
+        // bakes defaults into its filename. -pack/-version below are authoritative.
+        const installerUrl = versionId
+          ? `https://api.feed-the-beast.com/v1/modpacks/public/modpack/${packId}/${versionId}/server/linux`
+          : `https://api.feed-the-beast.com/v1/modpacks/public/modpack/${packId}/server/linux`;
+        const installerPath = "/root/ftb-installer/serverinstall";
+
+        console.log(
+          `[installFtb] Downloading FTB installer from ${installerUrl}`,
+        );
+        await sshExec(
+          sshHost,
+          sshUser,
+          `mkdir -p /root/ftb-installer ${serverDir} && wget -q -O ${installerPath} '${installerUrl}' && chmod +x ${installerPath}`,
+        );
+
+        const flags = [
+          `-pack ${packId}`,
+          versionId ? `-version ${versionId}` : "",
+          `-dir ${serverDir}`,
+          "-auto",
+          "-force",
+          "-no-java",
+          "-accept-eula",
+          "-no-colours",
+        ].filter(Boolean).join(" ");
+        console.log(`[installFtb] Running installer: serverinstall ${flags}`);
+        const result = await sshExec(
+          sshHost,
+          sshUser,
+          `set -o pipefail; cd /root/ftb-installer && ./serverinstall ${flags} 2>&1 | tail -20`,
+        );
+        console.log(result.stdout);
+
+        const handle = await context.writeResource("ftbInstall", vmName, {
+          packId,
+          versionId: versionId || "latest",
+          serverDir,
+          installerUrl,
+          timestamp: new Date().toISOString(),
+        });
+        return { dataHandles: [handle] };
+      },
+    },
+
     configure: {
       description: "Configure JVM memory, EULA, and server variables",
       arguments: z.object({
@@ -290,6 +373,23 @@ export const model: {
             `cd ${serverDir} && sed -i 's/RESTART=.*/RESTART=false/' variables.txt`,
           );
           console.log(`[configure] variables.txt updated`);
+        }
+
+        // NeoForge/Forge installer layout (run.sh + user_jvm_args.txt)
+        const hasJvmArgs = await sshExecRaw(
+          sshHost,
+          sshUser,
+          `test -f ${serverDir}/user_jvm_args.txt && echo yes || echo no`,
+        );
+        if (hasJvmArgs.stdout.trim() === "yes") {
+          console.log(
+            `[configure] Setting user_jvm_args.txt to -Xmx${jvmMemory} -Xms${jvmMemory}`,
+          );
+          await sshExec(
+            sshHost,
+            sshUser,
+            `cd ${serverDir} && sed -i '/^-Xm[sx]/d' user_jvm_args.txt && printf '\\n-Xmx${jvmMemory}\\n-Xms${jvmMemory}\\n' >> user_jvm_args.txt`,
+          );
         }
 
         // Accept EULA

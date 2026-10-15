@@ -1,6 +1,6 @@
 manifestVersion: 1
 name: "@keeb/minecraft"
-version: "2026.05.25.1"
+version: "2026.10.15.1"
 description: "Minecraft server control + installer + metrics collection (https://github.com/keeb/swamp-minecraft)"
 repository: https://github.com/keeb/swamp-minecraft
 additionalFiles:
@@ -17,12 +17,13 @@ models:
   - minecraft_server.ts
   - minecraft_installer.ts
 workflows:
-  - start-minecraft/workflow.yaml
-  - stop-minecraft/workflow.yaml
-  - reboot-minecraft/workflow.yaml
-  - status-minecraft/workflow.yaml
-  - minecraft-install/workflow.yaml
-  - collect-game-metrics/workflow.yaml
+  - workflow-e85aaef3-20fd-4cf9-b255-e9cf895d4066.yaml
+  - workflow-4e11e3ef-8854-4d31-a980-fd572f97c3e0.yaml
+  - workflow-7d166515-1eb3-4128-9c64-3249bc3cd645.yaml
+  - workflow-b1dc5f5d-baec-4b33-818a-59df0501469b.yaml
+  - workflow-7469bfde-1b52-4b7f-a3a5-1aa8200077f0.yaml
+  - minecraft-install-ftb/workflow.yaml
+  - workflow-d417e25d-e8df-468b-95f6-2d03739c82a8.yaml
 dependencies:
   - "@keeb/proxmox"
   - "@keeb/prometheus"

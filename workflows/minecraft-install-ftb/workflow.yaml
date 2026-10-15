@@ -1,0 +1,105 @@
+id: 00ae2e00-9c10-4dd5-8924-0dc4238db6a8
+name: '@keeb/minecraft-install-ftb'
+description: Install an FTB modpack server (via FTB's server installer) on any VM — deps, install, EULA + JVM config. Start with start-minecraft.
+inputs:
+  vmName:
+    type: string
+    required: true
+    description: Name of the VM to install on
+  packId:
+    type: string
+    required: true
+    description: FTB modpack ID (api.feed-the-beast.com)
+  versionId:
+    type: string
+    required: false
+    default: ''
+    description: FTB version ID (empty = latest)
+  javaPackage:
+    type: string
+    required: false
+    default: openjdk21-jre
+    description: Alpine JRE package matching the pack's Java target
+  serverDir:
+    type: string
+    required: false
+    default: ~/game
+    description: Remote directory for the server
+  jvmMemory:
+    type: string
+    required: false
+    default: 8G
+    description: JVM memory allocation
+jobs:
+  - name: main
+    description: Install deps, run FTB installer, configure
+    steps:
+      - name: auth
+        description: Authenticate with Proxmox
+        task:
+          type: model_method
+          modelIdOrName: keebDev02
+          methodName: auth
+        dependsOn: []
+        weight: 0
+      - name: lookup-vm
+        description: Lookup target VM to populate fleet resource
+        task:
+          type: model_method
+          modelIdOrName: fleet
+          methodName: lookup
+          inputs:
+            vmName: '${{ inputs.vmName }}'
+        dependsOn:
+          - step: auth
+            condition:
+              type: succeeded
+        weight: 0
+      - name: install-deps
+        description: Install JRE, tmux, bash, curl, unzip on the VM
+        task:
+          type: model_method
+          modelIdOrName: minecraftInstaller
+          methodName: installDeps
+          inputs:
+            vmName: '${{ inputs.vmName }}'
+            javaPackage: '${{ inputs.javaPackage }}'
+        dependsOn:
+          - step: lookup-vm
+            condition:
+              type: succeeded
+        weight: 0
+      - name: install-ftb
+        description: Run FTB server installer (modloader + mods, system Java)
+        task:
+          type: model_method
+          modelIdOrName: minecraftInstaller
+          methodName: installFtb
+          inputs:
+            vmName: '${{ inputs.vmName }}'
+            packId: '${{ inputs.packId }}'
+            versionId: '${{ inputs.versionId }}'
+            serverDir: '${{ inputs.serverDir }}'
+        dependsOn:
+          - step: install-deps
+            condition:
+              type: succeeded
+        weight: 0
+      - name: configure-server
+        description: Configure JVM memory, EULA
+        task:
+          type: model_method
+          modelIdOrName: minecraftInstaller
+          methodName: configure
+          inputs:
+            vmName: '${{ inputs.vmName }}'
+            serverDir: '${{ inputs.serverDir }}'
+            jvmMemory: '${{ inputs.jvmMemory }}'
+        dependsOn:
+          - step: install-ftb
+            condition:
+              type: succeeded
+        weight: 0
+    dependsOn: []
+    weight: 0
+version: 1
