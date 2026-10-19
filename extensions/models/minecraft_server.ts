@@ -1,7 +1,10 @@
 /**
  * @keeb/minecraft/server model — control a Minecraft server running in a
  * tmux session over SSH: start, stop, status, broadcast chat, op/deop
- * players, and collect player metrics for Prometheus textfile collector.
+ * players, draw block art, and collect player metrics for the Prometheus
+ * textfile collector.
+ *
+ * @module
  */
 import { z } from "npm:zod@4";
 import {
@@ -12,37 +15,29 @@ import {
 } from "./lib/ssh.ts";
 import { writeMetricsFiles } from "./lib/metrics.ts";
 import {
+  assertServerTarget,
+  buildMcmeta,
+  consoleRun,
+  functionDir,
+  logLineCount,
+  parsePackFormat,
+  parsePlayerList,
+  parsePlayerPose,
+  type PlayerList,
+  readLogFrom,
+  sanitizeConsoleText,
+  sendConsole,
+  serverTargetErrors,
+  tmuxSessionExists,
+  validateDimension,
+  validatePlayerName,
+} from "./lib/minecraft.ts";
+import {
+  type Facing,
   gridToCommands,
   imageToBlockGrid,
   yawToFacing,
 } from "./lib/pixelart.ts";
-
-// Send console commands via tmux and return the log lines they produced.
-async function consoleRun(
-  sshHost,
-  sshUser,
-  tmuxSession,
-  logPath,
-  commands,
-  waitMs = 2000,
-) {
-  const wc = await sshExecRaw(sshHost, sshUser, `wc -l < ${logPath}`);
-  const lineCount = parseInt(wc.stdout.trim(), 10) || 0;
-  for (const cmd of commands) {
-    await sshExecRaw(
-      sshHost,
-      sshUser,
-      `tmux send-keys -t ${tmuxSession} '${cmd}' Enter`,
-    );
-  }
-  await new Promise((r) => setTimeout(r, waitMs));
-  const tail = await sshExecRaw(
-    sshHost,
-    sshUser,
-    `tail -n +${lineCount + 1} ${logPath}`,
-  );
-  return tail.stdout;
-}
 
 const GlobalArgs = z.object({
   sshHost: z.string().nullable().describe(
@@ -61,6 +56,26 @@ const GlobalArgs = z.object({
     "Resource instance name for writeResource",
   ),
 });
+
+/** Validated global arguments of `@keeb/minecraft/server`. */
+export type ServerGlobalArgs = z.infer<typeof GlobalArgs>;
+
+/** The subset of the swamp logger these methods use. */
+export interface Logger {
+  info(message: string, properties?: Record<string, unknown>): void;
+  warning(message: string, properties?: Record<string, unknown>): void;
+}
+
+/** The subset of the swamp method context these methods use. */
+export interface ServerContext {
+  globalArgs: ServerGlobalArgs;
+  logger: Logger;
+  writeResource: (
+    specName: string,
+    name: string,
+    data: Record<string, unknown>,
+  ) => Promise<unknown>;
+}
 
 const ServerSchema = z.object({
   success: z.boolean().optional(),
@@ -94,16 +109,106 @@ const DrawingSchema = z.object({
   timestamp: z.string(),
 });
 
+const SayArgs = z.object({
+  message: z.string().default("").describe("Message to broadcast"),
+});
+const OpArgs = z.object({
+  playerName: z.string().default("").describe("Player name to op"),
+});
+const DeopArgs = z.object({
+  playerName: z.string().default("").describe("Player name to deop"),
+});
+const DrawImageArgs = z.object({
+  imagePath: z.string().default("").describe(
+    "Local path to a PNG (transparent pixels are skipped)",
+  ),
+  width: z.number().default(64).describe(
+    "Width in blocks; height keeps the image aspect ratio",
+  ),
+  anchorPlayer: z.string().default("").describe(
+    "Anchor on this online player's current position/facing (overrides x/y/z/facing/dimension)",
+  ),
+  x: z.number().nullable().default(null).describe("Anchor x"),
+  y: z.number().nullable().default(null).describe("Anchor y"),
+  z: z.number().nullable().default(null).describe("Anchor z"),
+  facing: z.enum(["", "north", "south", "east", "west"]).default("")
+    .describe("Direction the viewer at the anchor looks"),
+  dimension: z.string().default("minecraft:overworld").describe(
+    "Dimension id",
+  ),
+  orientation: z.enum(["wall", "floor"]).default("wall").describe(
+    "Upright wall in front of the anchor, or flat on the ground",
+  ),
+  distance: z.number().default(10).describe(
+    "Blocks between the anchor and the art",
+  ),
+  alphaThreshold: z.number().default(128)
+    .describe("Average alpha below this leaves the block untouched"),
+  name: z.string().default("draw").describe(
+    "Function name: swampdraw:<name> (re-runnable later)",
+  ),
+  packFormat: z.number().default(0).describe(
+    "Datapack format; 0 = detect from the server jar's version.json",
+  ),
+});
+const NoArgs = z.object({});
+
+const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
+/** Shared preamble: validate config, then report whether the console is reachable. */
+async function consoleAvailable(
+  context: ServerContext,
+  method: string,
+): Promise<boolean> {
+  const g = context.globalArgs;
+  if (!isValidSshHost(g.sshHost)) {
+    context.logger.info("{method}: no sshHost, skipping", { method });
+    return false;
+  }
+  assertServerTarget(g);
+  if (!(await tmuxSessionExists(g.sshHost, g.sshUser, g.tmuxSession))) {
+    context.logger.info("{method}: no tmux session {session}, skipping", {
+      method,
+      session: g.tmuxSession,
+    });
+    return false;
+  }
+  return true;
+}
+
+async function writeServer(
+  context: ServerContext,
+  data: Record<string, unknown>,
+): Promise<{ dataHandles: unknown[] }> {
+  const handle = await context.writeResource(
+    "server",
+    context.globalArgs.serverName,
+    data,
+  );
+  return { dataHandles: [handle] };
+}
+
+/** Send `list` and parse the response; null when the reply wasn't seen. */
+async function queryPlayers(g: ServerGlobalArgs): Promise<PlayerList | null> {
+  const host = g.sshHost as string;
+  const from = await logLineCount(host, g.sshUser, g.logPath);
+  await sendConsole(host, g.sshUser, g.tmuxSession, ["list"]);
+  await sleep(2000);
+  return parsePlayerList(await readLogFrom(host, g.sshUser, g.logPath, from));
+}
+
 /** Swamp model definition for `@keeb/minecraft/server`. */
-export const model: {
-  type: string;
-  version: string;
-  resources: Record<string, unknown>;
-  globalArguments: typeof GlobalArgs;
-  methods: Record<string, unknown>;
-} = {
+export const model = {
   type: "@keeb/minecraft/server",
-  version: "2026.02.18.2",
+  version: "2026.10.15.2",
+  upgrades: [
+    {
+      toVersion: "2026.10.15.2",
+      description:
+        "No schema changes; global arguments are now validated before use",
+      upgradeAttributes: (old: Record<string, unknown>) => old,
+    },
+  ],
   resources: {
     "server": {
       description: "Minecraft server operation result",
@@ -125,267 +230,175 @@ export const model: {
     },
   },
   globalArguments: GlobalArgs,
+  checks: {
+    "valid-server-target": {
+      description:
+        "Global arguments (tmux session, paths, user, serverName) are safe to use in remote shell commands",
+      labels: ["policy"],
+      execute: (context: { globalArgs: ServerGlobalArgs }) => {
+        const errors = serverTargetErrors(context.globalArgs);
+        return Promise.resolve(
+          errors.length ? { pass: false, errors } : { pass: true },
+        );
+      },
+    },
+  },
   methods: {
     say: {
       description:
         "Broadcast a message to Minecraft players via the server console",
-      arguments: z.object({
-        message: z.string().default("").describe("Message to broadcast"),
-      }),
-      execute: async (args, context) => {
-        if (!args.message) throw new Error("message is required");
-        const { message } = args;
-        const { sshHost, sshUser = "root", tmuxSession, serverName } =
-          context.globalArgs;
-
-        if (!isValidSshHost(sshHost)) {
-          console.log(`[say] No sshHost - skipping`);
-          const handle = await context.writeResource("server", serverName, {
-            success: true,
-            skipped: true,
-          });
-          return { dataHandles: [handle] };
+      arguments: SayArgs,
+      execute: async (
+        args: z.infer<typeof SayArgs>,
+        context: ServerContext,
+      ) => {
+        const message = sanitizeConsoleText(args.message);
+        if (!message) throw new Error("message is required");
+        if (!(await consoleAvailable(context, "say"))) {
+          return await writeServer(context, { success: true, skipped: true });
         }
-
-        const tmuxCheck = await sshExecRaw(
-          sshHost,
-          sshUser,
-          `tmux has-session -t ${tmuxSession} 2>/dev/null && echo exists || echo missing`,
-        );
-        if (tmuxCheck.stdout.trim() !== "exists") {
-          console.log(`[say] No tmux session - server not running`);
-          const handle = await context.writeResource("server", serverName, {
-            success: true,
-            skipped: true,
-          });
-          return { dataHandles: [handle] };
-        }
-
-        console.log(`[say] Broadcasting: ${message}`);
-        await sshExecRaw(
-          sshHost,
-          sshUser,
-          `tmux send-keys -t ${tmuxSession} 'say ${message}' Enter`,
-        );
-
-        const handle = await context.writeResource("server", serverName, {
-          success: true,
-          skipped: false,
-        });
-        return { dataHandles: [handle] };
+        const g = context.globalArgs;
+        context.logger.info("Broadcasting {message}", { message });
+        await sendConsole(g.sshHost as string, g.sshUser, g.tmuxSession, [
+          `say ${message}`,
+        ]);
+        return await writeServer(context, { success: true, skipped: false });
       },
     },
 
     op: {
       description: "Grant operator status to a Minecraft player",
-      arguments: z.object({
-        playerName: z.string().default("").describe("Player name to op"),
-      }),
-      execute: async (args, context) => {
+      arguments: OpArgs,
+      execute: async (
+        args: z.infer<typeof OpArgs>,
+        context: ServerContext,
+      ) => {
         if (!args.playerName) throw new Error("playerName is required");
-        const sanitized = args.playerName.replace(/[^a-zA-Z0-9_]/g, "");
-        const { sshHost, sshUser = "root", tmuxSession, serverName } =
-          context.globalArgs;
-
-        if (!isValidSshHost(sshHost)) {
-          console.log(`[op] No sshHost - skipping`);
-          const handle = await context.writeResource("server", serverName, {
-            success: true,
-            skipped: true,
-          });
-          return { dataHandles: [handle] };
+        const player = validatePlayerName(args.playerName);
+        if (!(await consoleAvailable(context, "op"))) {
+          return await writeServer(context, { success: true, skipped: true });
         }
-
-        const tmuxCheck = await sshExecRaw(
-          sshHost,
-          sshUser,
-          `tmux has-session -t ${tmuxSession} 2>/dev/null && echo exists || echo missing`,
-        );
-        if (tmuxCheck.stdout.trim() !== "exists") {
-          console.log(`[op] No tmux session - server not running`);
-          const handle = await context.writeResource("server", serverName, {
-            success: true,
-            skipped: true,
-          });
-          return { dataHandles: [handle] };
-        }
-
-        console.log(`[op] Granting op to: ${sanitized}`);
-        await sshExecRaw(
-          sshHost,
-          sshUser,
-          `tmux send-keys -t ${tmuxSession} 'op ${sanitized}' Enter`,
-        );
-
-        const handle = await context.writeResource("server", serverName, {
-          success: true,
-          skipped: false,
-        });
-        return { dataHandles: [handle] };
+        const g = context.globalArgs;
+        context.logger.info("Granting op to {player}", { player });
+        await sendConsole(g.sshHost as string, g.sshUser, g.tmuxSession, [
+          `op ${player}`,
+        ]);
+        return await writeServer(context, { success: true, skipped: false });
       },
     },
 
     deop: {
       description: "Revoke operator status from a Minecraft player",
-      arguments: z.object({
-        playerName: z.string().default("").describe("Player name to deop"),
-      }),
-      execute: async (args, context) => {
+      arguments: DeopArgs,
+      execute: async (
+        args: z.infer<typeof DeopArgs>,
+        context: ServerContext,
+      ) => {
         if (!args.playerName) throw new Error("playerName is required");
-        const sanitized = args.playerName.replace(/[^a-zA-Z0-9_]/g, "");
-        const { sshHost, sshUser = "root", tmuxSession, serverName } =
-          context.globalArgs;
-
-        if (!isValidSshHost(sshHost)) {
-          console.log(`[deop] No sshHost - skipping`);
-          const handle = await context.writeResource("server", serverName, {
-            success: true,
-            skipped: true,
-          });
-          return { dataHandles: [handle] };
+        const player = validatePlayerName(args.playerName);
+        if (!(await consoleAvailable(context, "deop"))) {
+          return await writeServer(context, { success: true, skipped: true });
         }
-
-        const tmuxCheck = await sshExecRaw(
-          sshHost,
-          sshUser,
-          `tmux has-session -t ${tmuxSession} 2>/dev/null && echo exists || echo missing`,
-        );
-        if (tmuxCheck.stdout.trim() !== "exists") {
-          console.log(`[deop] No tmux session - server not running`);
-          const handle = await context.writeResource("server", serverName, {
-            success: true,
-            skipped: true,
-          });
-          return { dataHandles: [handle] };
-        }
-
-        console.log(`[deop] Revoking op from: ${sanitized}`);
-        await sshExecRaw(
-          sshHost,
-          sshUser,
-          `tmux send-keys -t ${tmuxSession} 'deop ${sanitized}' Enter`,
-        );
-
-        const handle = await context.writeResource("server", serverName, {
-          success: true,
-          skipped: false,
-        });
-        return { dataHandles: [handle] };
+        const g = context.globalArgs;
+        context.logger.info("Revoking op from {player}", { player });
+        await sendConsole(g.sshHost as string, g.sshUser, g.tmuxSession, [
+          `deop ${player}`,
+        ]);
+        return await writeServer(context, { success: true, skipped: false });
       },
     },
 
     drawImage: {
       description:
         "Draw a PNG into the world as block art (concrete/wool/terracotta) via a generated datapack function, anchored on a player or fixed coordinates",
-      arguments: z.object({
-        imagePath: z.string().default("").describe(
-          "Local path to a PNG (transparent pixels are skipped)",
-        ),
-        width: z.number().default(64).describe(
-          "Width in blocks; height keeps the image aspect ratio",
-        ),
-        anchorPlayer: z.string().default("").describe(
-          "Anchor on this online player's current position/facing (overrides x/y/z/facing/dimension)",
-        ),
-        x: z.number().nullable().default(null).describe("Anchor x"),
-        y: z.number().nullable().default(null).describe("Anchor y"),
-        z: z.number().nullable().default(null).describe("Anchor z"),
-        facing: z.enum(["", "north", "south", "east", "west"]).default("")
-          .describe("Direction the viewer at the anchor looks"),
-        dimension: z.string().default("minecraft:overworld").describe(
-          "Dimension id",
-        ),
-        orientation: z.enum(["wall", "floor"]).default("wall").describe(
-          "Upright wall in front of the anchor, or flat on the ground",
-        ),
-        distance: z.number().default(10).describe(
-          "Blocks between the anchor and the art",
-        ),
-        alphaThreshold: z.number().default(128)
-          .describe("Average alpha below this leaves the block untouched"),
-        name: z.string().default("draw").describe(
-          "Function name: swampdraw:<name> (re-runnable later)",
-        ),
-        packFormat: z.number().default(0).describe(
-          "Datapack format; 0 = detect from the server jar's version.json",
-        ),
-      }),
-      execute: async (args, context) => {
+      arguments: DrawImageArgs,
+      execute: async (
+        args: z.infer<typeof DrawImageArgs>,
+        context: ServerContext,
+      ) => {
         if (!args.imagePath) throw new Error("imagePath is required");
         const width = Math.round(args.width);
         const distance = Math.round(args.distance);
-        if (width < 1 || width > 512) throw new Error("width must be 1-512");
-        if (distance < 1) throw new Error("distance must be >= 1");
+        if (!(width >= 1 && width <= 512)) {
+          throw new Error("width must be 1-512");
+        }
+        if (!(distance >= 1)) throw new Error("distance must be >= 1");
         const alphaThreshold = Math.min(255, Math.max(1, args.alphaThreshold));
         const fnName = args.name.toLowerCase().replace(/[^a-z0-9_]/g, "_");
-        const {
-          sshHost,
-          sshUser = "root",
-          tmuxSession,
-          serverDir,
-          logPath,
-          serverName,
-        } = context.globalArgs;
-
-        if (!isValidSshHost(sshHost)) {
+        if (!fnName) throw new Error("name is required");
+        // Pure argument checks first, so bad input fails before any I/O.
+        const anchorPlayer = args.anchorPlayer
+          ? validatePlayerName(args.anchorPlayer)
+          : "";
+        if (!anchorPlayer) {
+          if (args.x === null || args.y === null || args.z === null) {
+            throw new Error("Provide anchorPlayer or all of x, y, z");
+          }
+          if (!args.facing) throw new Error("facing is required with x/y/z");
+          validateDimension(args.dimension);
+        }
+        const g = context.globalArgs;
+        const { sshUser, tmuxSession, serverDir, logPath } = g;
+        if (!isValidSshHost(g.sshHost)) {
           throw new Error("sshHost is required - is the VM running?");
         }
-        const tmuxCheck = await sshExecRaw(
-          sshHost,
-          sshUser,
-          `tmux has-session -t ${tmuxSession} 2>/dev/null && echo exists || echo missing`,
+        const sshHost = g.sshHost;
+        assertServerTarget(g);
+
+        // Image -> block grid (local; fails before touching the server)
+        const png = await Deno.readFile(args.imagePath);
+        const { height, grid } = await imageToBlockGrid(
+          png,
+          width,
+          alphaThreshold,
         );
-        if (tmuxCheck.stdout.trim() !== "exists") {
-          throw new Error("No tmux session - server not running");
+        if (!grid.some((row) => row.some((b) => b !== null))) {
+          throw new Error(
+            `${args.imagePath} has no pixels above alphaThreshold ${alphaThreshold}; nothing to draw`,
+          );
+        }
+
+        if (!(await tmuxSessionExists(sshHost, sshUser, tmuxSession))) {
+          throw new Error(
+            `No tmux session ${tmuxSession} on ${sshHost} - server not running`,
+          );
         }
 
         // Resolve the anchor
-        let anchor, facing = args.facing, dimension = args.dimension;
-        if (args.anchorPlayer) {
-          const player = args.anchorPlayer.replace(/[^a-zA-Z0-9_]/g, "");
+        let anchor: number[];
+        let facing: Facing;
+        let dimension = args.dimension;
+        if (anchorPlayer) {
           const out = await consoleRun(
             sshHost,
             sshUser,
             tmuxSession,
             logPath,
             [
-              `data get entity ${player} Pos`,
-              `data get entity ${player} Rotation`,
-              `data get entity ${player} Dimension`,
+              `data get entity ${anchorPlayer} Pos`,
+              `data get entity ${anchorPlayer} Rotation`,
+              `data get entity ${anchorPlayer} Dimension`,
             ],
           );
-          const pos = out.match(
-            /entity data: \[(-?[\d.E-]+)d, (-?[\d.E-]+)d, (-?[\d.E-]+)d\]/,
-          );
-          const rot = out.match(
-            /entity data: \[(-?[\d.E-]+)f, (-?[\d.E-]+)f\]/,
-          );
-          const dim = out.match(/entity data: "([^"]+)"/);
-          if (!pos || !rot) {
+          const pose = parsePlayerPose(out);
+          if (!pose) {
             throw new Error(
-              `Could not read position of ${player} (offline?). Log:\n${out}`,
+              `Could not read position of ${anchorPlayer} (offline?). Log:\n${out}`,
             );
           }
-          anchor = [pos[1], pos[2], pos[3]].map(Number);
-          facing = yawToFacing(Number(rot[1]));
-          if (dim) dimension = dim[1];
+          anchor = pose.pos;
+          facing = yawToFacing(pose.yaw);
+          if (pose.dimension) dimension = pose.dimension;
+          validateDimension(dimension);
         } else {
-          if (args.x === null || args.y === null || args.z === null) {
-            throw new Error("Provide anchorPlayer or all of x, y, z");
-          }
-          if (!facing) throw new Error("facing is required with x/y/z");
-          anchor = [args.x, args.y, args.z];
+          anchor = [args.x as number, args.y as number, args.z as number];
+          facing = args.facing as Facing;
         }
-        console.log(
-          `[drawImage] Anchor ${
-            anchor.join(", ")
-          } in ${dimension}, facing ${facing}`,
+        context.logger.info(
+          "Anchor {anchor} in {dimension}, facing {facing}",
+          { anchor: anchor.join(", "), dimension, facing },
         );
 
-        // Image -> blocks -> fill commands
-        // @ts-ignore - Deno API
-        const png = await Deno.readFile(args.imagePath);
-        const { height, grid } = imageToBlockGrid(png, width, alphaThreshold);
         const { commands, counts, blocks, corners } = gridToCommands(
           grid,
           anchor,
@@ -393,8 +406,9 @@ export const model: {
           args.orientation,
           distance,
         );
-        console.log(
-          `[drawImage] ${width}x${height} image -> ${blocks} blocks in ${commands.length} fill commands`,
+        context.logger.info(
+          "{width}x{height} image -> {blocks} blocks in {commands} fill commands",
+          { width, height, blocks, commands: commands.length },
         );
         const minY = Math.min(corners[0][1], corners[1][1]);
         const maxY = Math.max(corners[0][1], corners[1][1]);
@@ -413,36 +427,30 @@ export const model: {
             `cd ${serverDir} && J=$(ls libraries/net/minecraft/server/*/server-*.jar 2>/dev/null | tail -1); unzip -p "\${J:-server.jar}" version.json`,
           );
           try {
-            const pv = JSON.parse(ver.stdout).pack_version;
-            packFormat = typeof pv === "number"
-              ? pv
-              : (pv.data_major ?? pv.data);
-          } catch {
+            packFormat = parsePackFormat(ver.stdout);
+          } catch (e) {
             throw new Error(
-              `Could not detect pack format (pass packFormat): ${ver.stderr}`,
+              `Could not detect pack format (pass packFormat): ${
+                (e as Error).message
+              } ${ver.stderr}`,
             );
           }
         }
-        const mcmeta = packFormat >= 82
-          ? {
-            pack: {
-              description: "swampdraw",
-              min_format: packFormat,
-              max_format: packFormat,
-            },
-          }
-          : { pack: { description: "swampdraw", pack_format: packFormat } };
-        // 1.21+ uses data/<ns>/function, older uses functions
-        const fnDir = packFormat >= 45 ? "function" : "functions";
+        const mcmeta = buildMcmeta(packFormat);
+        const fnDir = functionDir(packFormat);
 
         const levelName = (await sshExecRaw(
           sshHost,
           sshUser,
-          `grep '^level-name=' ${serverDir}/server.properties | cut -d= -f2`,
+          `grep '^level-name=' ${serverDir}/server.properties | cut -d= -f2-`,
         )).stdout.trim() || "world";
+        if (levelName.includes("/") || levelName.startsWith(".")) {
+          throw new Error(`Refusing unexpected level-name "${levelName}"`);
+        }
         const packDir = `${serverDir}/${levelName}/datapacks/swampdraw`;
-        console.log(
-          `[drawImage] Writing datapack (format ${packFormat}) to ${packDir}`,
+        context.logger.info(
+          "Writing datapack (format {packFormat}) to {packDir}",
+          { packFormat, packDir },
         );
         await sshWriteFile(
           sshHost,
@@ -461,32 +469,28 @@ export const model: {
         // reload (can take minutes on big modpacks), so send once and poll.
         const run = `execute in ${dimension} run function swampdraw:${fnName}`;
         const runAndWait = async () => {
-          const wc = await sshExecRaw(sshHost, sshUser, `wc -l < ${logPath}`);
-          const from = (parseInt(wc.stdout.trim(), 10) || 0) + 1;
-          await sshExecRaw(
-            sshHost,
-            sshUser,
-            `tmux send-keys -t ${tmuxSession} 'reload' Enter && tmux send-keys -t ${tmuxSession} '${run}' Enter`,
-          );
+          const from = await logLineCount(sshHost, sshUser, logPath);
+          await sendConsole(sshHost, sshUser, tmuxSession, ["reload", run]);
           const deadline = Date.now() + 300000;
           while (Date.now() < deadline) {
-            await new Promise((r) => setTimeout(r, 5000));
-            const out = (await sshExecRaw(
-              sshHost,
-              sshUser,
-              `tail -n +${from} ${logPath} | grep -E 'function swampdraw:${fnName}|Unknown function'`,
-            )).stdout;
+            await sleep(5000);
+            const out = await readLogFrom(sshHost, sshUser, logPath, from);
             if (/Unknown function/i.test(out)) return "unknown";
-            if (/(Running|Executed).*function swampdraw:/.test(out)) {
+            if (
+              new RegExp(
+                `(Running|Executed).*function '?swampdraw:${fnName}\\b`,
+              )
+                .test(out)
+            ) {
               return "ran";
             }
           }
           return "timeout";
         };
-        console.log(`[drawImage] Reloading datapacks and running ${run}...`);
+        context.logger.info("Reloading datapacks and running {run}", { run });
         let result = await runAndWait();
         if (result === "unknown") {
-          console.log(`[drawImage] Function unknown, enabling pack...`);
+          context.logger.info("Function unknown, enabling pack", {});
           await consoleRun(sshHost, sshUser, tmuxSession, logPath, [
             'datapack enable "file/swampdraw"',
           ]);
@@ -516,29 +520,39 @@ export const model: {
           3000,
         );
         const verified = (checkOut.match(/Test passed/g) || []).length;
-        console.log(
-          `[drawImage] Spot-check ${verified}/${picks.length} passed; corners ${
-            JSON.stringify(corners)
-          }`,
+        context.logger.info(
+          "Spot-check {verified}/{total} passed; corners {corners}",
+          {
+            verified,
+            total: picks.length,
+            corners: JSON.stringify(corners),
+          },
         );
 
-        const handle = await context.writeResource("drawing", serverName, {
-          success: verified === picks.length,
-          imagePath: args.imagePath,
-          function: `swampdraw:${fnName}`,
-          dimension,
-          anchor,
-          facing,
-          orientation: args.orientation,
-          width,
-          height,
-          blocks,
-          commands: commands.length,
-          corners,
-          palette: JSON.stringify(counts),
-          verified,
-          timestamp: new Date().toISOString(),
-        });
+        // Own instance name per drawing: instance names share one namespace
+        // across specs, so reusing serverName would interleave drawings with
+        // the server status history.
+        const handle = await context.writeResource(
+          "drawing",
+          `drawing-${fnName}`,
+          {
+            success: verified === picks.length,
+            imagePath: args.imagePath,
+            function: `swampdraw:${fnName}`,
+            dimension,
+            anchor,
+            facing,
+            orientation: args.orientation,
+            width,
+            height,
+            blocks,
+            commands: commands.length,
+            corners,
+            palette: JSON.stringify(counts),
+            verified,
+            timestamp: new Date().toISOString(),
+          },
+        );
         return { dataHandles: [handle] };
       },
     },
@@ -546,357 +560,249 @@ export const model: {
     warnShutdown: {
       description:
         "Broadcast a shutdown warning to Minecraft players and wait 30 seconds",
-      arguments: z.object({}),
-      execute: async (_args, context) => {
-        const { sshHost, sshUser = "root", tmuxSession, serverName } =
-          context.globalArgs;
-
-        if (!isValidSshHost(sshHost)) {
-          console.log(`[warnShutdown] No sshHost - skipping warning`);
-          const handle = await context.writeResource("server", serverName, {
-            success: true,
-            skipped: true,
-          });
-          return { dataHandles: [handle] };
+      arguments: NoArgs,
+      execute: async (
+        _args: Record<string, never>,
+        context: ServerContext,
+      ) => {
+        if (!(await consoleAvailable(context, "warnShutdown"))) {
+          return await writeServer(context, { success: true, skipped: true });
         }
-
-        // Check tmux session exists
-        const tmuxCheck = await sshExecRaw(
-          sshHost,
-          sshUser,
-          `tmux has-session -t ${tmuxSession} 2>/dev/null && echo exists || echo missing`,
-        );
-        if (tmuxCheck.stdout.trim() !== "exists") {
-          console.log(`[warnShutdown] No tmux session - skipping warning`);
-          const handle = await context.writeResource("server", serverName, {
-            success: true,
-            skipped: true,
-          });
-          return { dataHandles: [handle] };
-        }
-
-        // Broadcast warning 3 times
-        console.log(`[warnShutdown] Broadcasting shutdown warning...`);
-        for (let i = 0; i < 3; i++) {
-          await sshExecRaw(
-            sshHost,
-            sshUser,
-            `tmux send-keys -t ${tmuxSession} 'say == SERVER SHUTTING DOWN IN 30 SECONDS ==' Enter`,
-          );
-        }
-
-        // Wait 30 seconds
-        console.log(`[warnShutdown] Waiting 30s...`);
-        await new Promise((r) => setTimeout(r, 30000));
-
-        console.log(`[warnShutdown] Done`);
-        const handle = await context.writeResource("server", serverName, {
-          success: true,
-          skipped: false,
-        });
-        return { dataHandles: [handle] };
+        const g = context.globalArgs;
+        context.logger.info("Broadcasting shutdown warning", {});
+        const warning = "say == SERVER SHUTTING DOWN IN 30 SECONDS ==";
+        await sendConsole(g.sshHost as string, g.sshUser, g.tmuxSession, [
+          warning,
+          warning,
+          warning,
+        ]);
+        context.logger.info("Waiting 30s before shutdown", {});
+        await sleep(30000);
+        context.logger.info("Shutdown warning complete", {});
+        return await writeServer(context, { success: true, skipped: false });
       },
     },
 
     stopMinecraftServer: {
       description:
         "Gracefully stop a Minecraft server running in a tmux session via SSH, then wait for java to exit",
-      arguments: z.object({}),
-      execute: async (_args, context) => {
-        const { sshHost, sshUser = "root", tmuxSession, serverName } =
-          context.globalArgs;
-
-        if (!isValidSshHost(sshHost)) {
-          console.log(
-            `[stopMinecraftServer] No sshHost - VM may be stopped already`,
-          );
-          const handle = await context.writeResource("server", serverName, {
+      arguments: NoArgs,
+      execute: async (
+        _args: Record<string, never>,
+        context: ServerContext,
+      ) => {
+        const g = context.globalArgs;
+        const alreadyStopped = () =>
+          writeServer(context, {
             success: true,
             alreadyStopped: true,
             timedOut: false,
             timestamp: new Date().toISOString(),
           });
-          return { dataHandles: [handle] };
-        }
 
-        // Quick SSH reachability check
+        if (!isValidSshHost(g.sshHost)) {
+          context.logger.info("No sshHost - VM may be stopped already", {});
+          return await alreadyStopped();
+        }
+        const sshHost = g.sshHost;
+        const { sshUser, tmuxSession } = g;
+        assertServerTarget(g);
+
         const reachable = await sshExecRaw(sshHost, sshUser, "echo ok");
         if (reachable.code !== 0) {
-          console.log(
-            `[stopMinecraftServer] SSH unreachable at ${sshHost} - VM may be stopped already`,
+          context.logger.info(
+            "SSH unreachable at {host} - VM may be stopped already",
+            { host: sshHost },
           );
-          const handle = await context.writeResource("server", serverName, {
-            success: true,
-            alreadyStopped: true,
-            timedOut: false,
-            timestamp: new Date().toISOString(),
-          });
-          return { dataHandles: [handle] };
+          return await alreadyStopped();
         }
 
-        // Check if tmux session exists and java is running
-        const tmuxCheck = await sshExecRaw(
+        const tmuxExists = await tmuxSessionExists(
           sshHost,
           sshUser,
-          `tmux has-session -t ${tmuxSession} 2>/dev/null && echo exists || echo missing`,
+          tmuxSession,
         );
+        // "[j]ava" so pgrep doesn't match the remote shell running this line.
         const javaCheck = await sshExecRaw(
           sshHost,
           sshUser,
-          "pgrep -f java > /dev/null 2>&1 && echo running || echo stopped",
+          "pgrep -f '[j]ava' > /dev/null 2>&1 && echo running || echo stopped",
         );
-
-        const tmuxExists = tmuxCheck.stdout.trim() === "exists";
         const javaRunning = javaCheck.stdout.trim() === "running";
 
         if (!tmuxExists && !javaRunning) {
-          console.log(
-            `[stopMinecraftServer] No tmux session and no java process - server already stopped`,
+          context.logger.info(
+            "No tmux session and no java process - server already stopped",
+            {},
           );
-          const handle = await context.writeResource("server", serverName, {
-            success: true,
-            alreadyStopped: true,
-            timedOut: false,
-            timestamp: new Date().toISOString(),
-          });
-          return { dataHandles: [handle] };
+          return await alreadyStopped();
         }
 
-        // Send 'stop' command to MC console
         if (tmuxExists) {
-          console.log(
-            `[stopMinecraftServer] Sending 'stop' command to tmux session '${tmuxSession}'...`,
-          );
-          await sshExecRaw(
-            sshHost,
-            sshUser,
-            `tmux send-keys -t ${tmuxSession} 'stop' Enter`,
-          );
+          context.logger.info("Sending stop to tmux session {session}", {
+            session: tmuxSession,
+          });
+          await sendConsole(sshHost, sshUser, tmuxSession, ["stop"]);
         }
 
-        // Wait for java to exit
+        let timedOut = false;
         const javaPid = await sshExecRaw(
           sshHost,
           sshUser,
-          "pgrep -f 'java.*neoforge' || pgrep -f java",
+          "pgrep -f '[j]ava.*neoforge' || pgrep -f '[j]ava'",
         );
         const originalPid = javaPid.stdout.trim().split("\n")[0];
-        console.log(
-          `[stopMinecraftServer] Tracking java PID ${originalPid}, waiting for exit (up to 90s)...`,
-        );
-
-        const pollTimeout = 90;
-        const pollStart = Date.now();
-        const pollDeadline = pollStart + (pollTimeout * 1000);
-        let timedOut = false;
-
-        while (Date.now() < pollDeadline) {
-          await new Promise((r) => setTimeout(r, 3000));
-          const check = await sshExecRaw(
-            sshHost,
-            sshUser,
-            `kill -0 ${originalPid} 2>/dev/null && echo running || echo stopped`,
+        if (/^\d+$/.test(originalPid)) {
+          context.logger.info(
+            "Tracking java PID {pid}, waiting for exit (up to 90s)",
+            { pid: originalPid },
           );
-          if (check.stdout.trim() === "stopped") {
-            const elapsed = Math.round((Date.now() - pollStart) / 1000);
-            console.log(
-              `[stopMinecraftServer] Java PID ${originalPid} exited after ${elapsed}s`,
-            );
-            break;
-          }
-        }
-
-        if (Date.now() >= pollDeadline) {
+          const pollStart = Date.now();
+          const pollDeadline = pollStart + 90_000;
           timedOut = true;
-          console.log(
-            `[stopMinecraftServer] Timed out waiting for java to exit`,
-          );
+          while (Date.now() < pollDeadline) {
+            await sleep(3000);
+            const check = await sshExecRaw(
+              sshHost,
+              sshUser,
+              `kill -0 ${originalPid} 2>/dev/null && echo running || echo stopped`,
+            );
+            if (check.stdout.trim() === "stopped") {
+              timedOut = false;
+              context.logger.info("Java PID {pid} exited after {elapsed}s", {
+                pid: originalPid,
+                elapsed: Math.round((Date.now() - pollStart) / 1000),
+              });
+              break;
+            }
+          }
+          if (timedOut) {
+            context.logger.warning("Timed out waiting for java to exit", {});
+          }
+        } else {
+          context.logger.info("No java process found after stop", {});
         }
 
         // Kill tmux session to prevent the restart loop from respawning
-        console.log(
-          `[stopMinecraftServer] Killing tmux session to prevent restart loop...`,
-        );
+        context.logger.info("Killing tmux session to prevent restart loop", {});
         await sshExecRaw(
           sshHost,
           sshUser,
           `tmux kill-session -t ${tmuxSession} 2>/dev/null || true`,
         );
 
-        console.log(`[stopMinecraftServer] Done (timedOut=${timedOut})`);
-        const handle = await context.writeResource("server", serverName, {
+        context.logger.info("Stop complete (timedOut={timedOut})", {
+          timedOut,
+        });
+        return await writeServer(context, {
           success: true,
           alreadyStopped: false,
           timedOut,
           ip: sshHost,
           timestamp: new Date().toISOString(),
         });
-        return { dataHandles: [handle] };
       },
     },
 
     status: {
       description: "Query Minecraft server status: player count and names",
-      arguments: z.object({}),
-      execute: async (_args, context) => {
-        const { sshHost, sshUser = "root", tmuxSession, logPath, serverName } =
-          context.globalArgs;
-
-        if (!isValidSshHost(sshHost)) {
-          console.log(`[status] No sshHost - VM may be stopped`);
-          const handle = await context.writeResource("server", serverName, {
+      arguments: NoArgs,
+      execute: async (
+        _args: Record<string, never>,
+        context: ServerContext,
+      ) => {
+        const g = context.globalArgs;
+        const notRunning = () =>
+          writeServer(context, {
             serverRunning: false,
             timestamp: new Date().toISOString(),
           });
-          return { dataHandles: [handle] };
-        }
 
-        // Quick SSH reachability check
-        const reachable = await sshExecRaw(sshHost, sshUser, "echo ok");
+        if (!isValidSshHost(g.sshHost)) {
+          context.logger.info("No sshHost - VM may be stopped", {});
+          return await notRunning();
+        }
+        assertServerTarget(g);
+        const reachable = await sshExecRaw(g.sshHost, g.sshUser, "echo ok");
         if (reachable.code !== 0) {
-          console.log(
-            `[status] SSH unreachable at ${sshHost} - VM may be stopped`,
-          );
-          const handle = await context.writeResource("server", serverName, {
-            serverRunning: false,
-            timestamp: new Date().toISOString(),
+          context.logger.info("SSH unreachable at {host} - VM may be stopped", {
+            host: g.sshHost,
           });
-          return { dataHandles: [handle] };
+          return await notRunning();
+        }
+        if (!(await tmuxSessionExists(g.sshHost, g.sshUser, g.tmuxSession))) {
+          context.logger.info("No tmux session - server not running", {});
+          return await notRunning();
         }
 
-        // Check tmux session exists
-        const tmuxCheck = await sshExecRaw(
-          sshHost,
-          sshUser,
-          `tmux has-session -t ${tmuxSession} 2>/dev/null && echo exists || echo missing`,
-        );
-        if (tmuxCheck.stdout.trim() !== "exists") {
-          console.log(`[status] No tmux session - server not running`);
-          const handle = await context.writeResource("server", serverName, {
-            serverRunning: false,
-            timestamp: new Date().toISOString(),
+        context.logger.info("Sending list command", {});
+        const list = await queryPlayers(g);
+        if (list) {
+          context.logger.info("{online}/{max} players online: {players}", {
+            online: list.online,
+            max: list.max,
+            players: list.players.join(", ") || "(none)",
           });
-          return { dataHandles: [handle] };
-        }
-
-        // Record current log line count
-        const wcResult = await sshExecRaw(
-          sshHost,
-          sshUser,
-          `wc -l < ${logPath}`,
-        );
-        const lineCount = parseInt(wcResult.stdout.trim(), 10) || 0;
-        console.log(
-          `[status] Log has ${lineCount} lines, sending 'list' command...`,
-        );
-
-        // Send 'list' command to MC console
-        await sshExecRaw(
-          sshHost,
-          sshUser,
-          `tmux send-keys -t ${tmuxSession} 'list' Enter`,
-        );
-
-        // Wait for server to process the command
-        await new Promise((r) => setTimeout(r, 2000));
-
-        // Read new log lines
-        const tailResult = await sshExecRaw(
-          sshHost,
-          sshUser,
-          `tail -n +${lineCount + 1} ${logPath}`,
-        );
-        const newLines = tailResult.stdout;
-
-        // Parse for player list response
-        const match = newLines.match(
-          /There are (\d+) of a max of (\d+) players online:(.*)/,
-        );
-        if (match) {
-          const online = parseInt(match[1], 10);
-          const max = parseInt(match[2], 10);
-          const playerStr = match[3].trim();
-          const players = playerStr
-            ? playerStr.split(",").map((p) => p.trim()).filter(Boolean)
-            : [];
-          console.log(
-            `[status] ${online}/${max} players online: ${
-              players.join(", ") || "(none)"
-            }`,
-          );
-          const handle = await context.writeResource("server", serverName, {
+          return await writeServer(context, {
             serverRunning: true,
-            online,
-            max,
-            players,
+            online: list.online,
+            max: list.max,
+            players: list.players,
             timestamp: new Date().toISOString(),
           });
-          return { dataHandles: [handle] };
         }
 
-        console.log(`[status] Could not parse player list from log`);
-        const handle = await context.writeResource("server", serverName, {
+        context.logger.warning("Could not parse player list from log", {});
+        return await writeServer(context, {
           serverRunning: true,
           online: null,
           max: null,
           players: [],
           timestamp: new Date().toISOString(),
         });
-        return { dataHandles: [handle] };
       },
     },
 
     startMinecraftServer: {
       description:
         "Start a Minecraft server in a tmux session via SSH on a running VM",
-      arguments: z.object({}),
-      execute: async (_args, context) => {
-        const {
-          sshHost,
-          sshUser = "root",
-          tmuxSession,
-          serverDir,
-          startScript,
-          logPath,
-          serverName,
-        } = context.globalArgs;
-
-        if (!isValidSshHost(sshHost)) {
+      arguments: NoArgs,
+      execute: async (
+        _args: Record<string, never>,
+        context: ServerContext,
+      ) => {
+        const g = context.globalArgs;
+        if (!isValidSshHost(g.sshHost)) {
           throw new Error("sshHost is required - is the VM running?");
         }
+        const sshHost = g.sshHost;
+        const { sshUser, tmuxSession, serverDir, startScript, logPath } = g;
+        assertServerTarget(g);
 
-        // Wait for SSH to be ready
-        console.log(`[startMinecraftServer] Waiting for SSH on ${sshHost}...`);
-        const sshReady = await waitForSsh(sshHost, sshUser);
-        if (!sshReady) {
+        context.logger.info("Waiting for SSH on {host}", { host: sshHost });
+        if (!(await waitForSsh(sshHost, sshUser))) {
           throw new Error(`SSH not reachable on ${sshHost} after 60s`);
         }
 
         const startLog = `/tmp/mc-start-${tmuxSession}.log`;
 
-        // Kill stale tmux session (ignore errors)
-        console.log(`[startMinecraftServer] Cleaning up stale tmux session...`);
+        context.logger.info("Cleaning up stale tmux session", {});
         await sshExecRaw(
           sshHost,
           sshUser,
           `tmux kill-session -t ${tmuxSession} 2>/dev/null || true`,
         );
 
-        // Truncate old log so we only detect the new "Done" line
+        // Truncate old logs so we only detect the new "Done" line
         await sshExecRaw(
           sshHost,
           sshUser,
-          `truncate -s 0 ${logPath} 2>/dev/null || true`,
-        );
-        await sshExecRaw(
-          sshHost,
-          sshUser,
-          `truncate -s 0 ${startLog} 2>/dev/null || true`,
+          `truncate -s 0 ${logPath} 2>/dev/null || true; truncate -s 0 ${startLog} 2>/dev/null || true`,
         );
 
-        // Start new tmux session with start script, capturing output to startLog
-        console.log(
-          `[startMinecraftServer] Starting Minecraft server in tmux session '${tmuxSession}', output → ${startLog}...`,
+        context.logger.info(
+          "Starting server in tmux session {session}, output to {startLog}",
+          { session: tmuxSession, startLog },
         );
         const startResult = await sshExecRaw(
           sshHost,
@@ -905,19 +811,18 @@ export const model: {
         );
         if (startResult.code !== 0) {
           throw new Error(
-            `Failed to start tmux session: ${startResult.stderr}`,
+            `Failed to start tmux session ${tmuxSession} on ${sshHost}: ${startResult.stderr}`,
           );
         }
 
-        // Wait for server to be ready (poll logs for "Done" message)
-        // Also detect early exit: if tmux session dies and log has an error, fail fast
-        const readyTimeout = 900; // 15 minutes (NeoForge install + modded server boot)
+        // Poll logs for "Done"; fail fast if the tmux session dies.
+        const readyTimeout = 900; // 15 minutes (NeoForge install + modded boot)
         const readyPoll = 5; // seconds
         const readyStart = Date.now();
         const readyDeadline = readyStart + (readyTimeout * 1000);
-        console.log(
-          `[startMinecraftServer] Waiting up to ${readyTimeout}s for server to be ready...`,
-        );
+        context.logger.info("Waiting up to {timeout}s for server to be ready", {
+          timeout: readyTimeout,
+        });
 
         let serverReady = false;
         while (Date.now() < readyDeadline) {
@@ -927,36 +832,32 @@ export const model: {
             `grep -q '\\]: Done (' ${logPath} 2>/dev/null && echo READY || echo WAITING`,
           );
           if (logCheck.stdout.trim() === "READY") {
-            const elapsed = Math.round((Date.now() - readyStart) / 1000);
-            console.log(
-              `[startMinecraftServer] Server is ready! (${elapsed}s)`,
-            );
+            context.logger.info("Server is ready after {elapsed}s", {
+              elapsed: Math.round((Date.now() - readyStart) / 1000),
+            });
             serverReady = true;
             break;
           }
 
-          // Check if tmux session already died (early crash)
-          const tmuxAlive = await sshExecRaw(
-            sshHost,
-            sshUser,
-            `tmux has-session -t ${tmuxSession} 2>/dev/null && echo alive || echo dead`,
-          );
-          if (tmuxAlive.stdout.trim() === "dead") {
+          if (!(await tmuxSessionExists(sshHost, sshUser, tmuxSession))) {
             const startOutput = await sshExecRaw(
               sshHost,
               sshUser,
               `cat ${startLog} 2>/dev/null || echo "(no output)"`,
             );
             throw new Error(
-              `Server process exited before becoming ready. start.sh output:\n${startOutput.stdout}`,
+              `Server process exited before becoming ready. start script output:\n${startOutput.stdout}`,
             );
           }
 
-          const elapsed = Math.round((Date.now() - readyStart) / 1000);
-          console.log(
-            `[startMinecraftServer] Server not ready yet (${elapsed}s elapsed), polling in ${readyPoll}s...`,
+          context.logger.info(
+            "Server not ready yet ({elapsed}s elapsed), polling in {poll}s",
+            {
+              elapsed: Math.round((Date.now() - readyStart) / 1000),
+              poll: readyPoll,
+            },
           );
-          await new Promise((r) => setTimeout(r, readyPoll * 1000));
+          await sleep(readyPoll * 1000);
         }
 
         if (!serverReady) {
@@ -966,126 +867,95 @@ export const model: {
             `cat ${startLog} 2>/dev/null || echo "(no output)"`,
           );
           throw new Error(
-            `Minecraft server did not become ready within ${readyTimeout}s. start.sh output:\n${startOutput.stdout}`,
+            `Minecraft server did not become ready within ${readyTimeout}s. start script output:\n${startOutput.stdout}`,
           );
         }
 
-        const handle = await context.writeResource("server", serverName, {
+        return await writeServer(context, {
           success: true,
           ip: sshHost,
           serverReady: true,
           timestamp: new Date().toISOString(),
         });
-        return { dataHandles: [handle] };
       },
     },
 
     collectMetrics: {
       description:
         "Collect player metrics and write Prometheus textfile + JSON log",
-      arguments: z.object({}),
-      execute: async (_args, context) => {
-        const { sshHost, sshUser = "root", tmuxSession, logPath, serverName } =
-          context.globalArgs;
-
-        if (!isValidSshHost(sshHost)) {
-          console.log(`[collectMetrics] No sshHost - VM may be stopped`);
+      arguments: NoArgs,
+      execute: async (
+        _args: Record<string, never>,
+        context: ServerContext,
+      ) => {
+        const g = context.globalArgs;
+        const { serverName } = g;
+        const writeMetrics = async (data: Record<string, unknown>) => {
           const handle = await context.writeResource("metrics", serverName, {
-            serverRunning: false,
-            online: 0,
-            max: null,
-            players: [],
+            ...data,
             timestamp: new Date().toISOString(),
           });
           return { dataHandles: [handle] };
-        }
+        };
+        const offline = {
+          serverRunning: false,
+          online: 0,
+          max: null,
+          players: [] as string[],
+        };
 
-        const reachable = await sshExecRaw(sshHost, sshUser, "echo ok");
+        if (!isValidSshHost(g.sshHost)) {
+          context.logger.info("No sshHost - VM may be stopped", {});
+          return await writeMetrics(offline);
+        }
+        const sshHost = g.sshHost;
+        assertServerTarget(g);
+
+        const reachable = await sshExecRaw(sshHost, g.sshUser, "echo ok");
         if (reachable.code !== 0) {
-          console.log(`[collectMetrics] SSH unreachable at ${sshHost}`);
-          const handle = await context.writeResource("metrics", serverName, {
-            serverRunning: false,
-            online: 0,
-            max: null,
-            players: [],
-            timestamp: new Date().toISOString(),
-          });
-          return { dataHandles: [handle] };
+          context.logger.info("SSH unreachable at {host}", { host: sshHost });
+          return await writeMetrics(offline);
         }
 
-        // Check tmux session
-        const tmuxCheck = await sshExecRaw(
-          sshHost,
-          sshUser,
-          `tmux has-session -t ${tmuxSession} 2>/dev/null && echo exists || echo missing`,
-        );
-        if (tmuxCheck.stdout.trim() !== "exists") {
-          console.log(`[collectMetrics] No tmux session - server not running`);
-          const data = {
-            serverRunning: false,
-            online: 0,
-            max: null,
-            players: [],
-          };
-          await writeMetricsFiles(sshHost, sshUser, "minecraft", serverName, {
-            ...data,
-          });
-          const handle = await context.writeResource("metrics", serverName, {
-            ...data,
-            timestamp: new Date().toISOString(),
-          });
-          return { dataHandles: [handle] };
+        if (!(await tmuxSessionExists(sshHost, g.sshUser, g.tmuxSession))) {
+          context.logger.info("No tmux session - server not running", {});
+          await writeMetricsFiles(
+            sshHost,
+            g.sshUser,
+            "minecraft",
+            serverName,
+            offline,
+          );
+          return await writeMetrics(offline);
         }
 
-        // Query players (same logic as status)
-        const wcResult = await sshExecRaw(
-          sshHost,
-          sshUser,
-          `wc -l < ${logPath}`,
-        );
-        const lineCount = parseInt(wcResult.stdout.trim(), 10) || 0;
-        await sshExecRaw(
-          sshHost,
-          sshUser,
-          `tmux send-keys -t ${tmuxSession} 'list' Enter`,
-        );
-        await new Promise((r) => setTimeout(r, 2000));
-        const tailResult = await sshExecRaw(
-          sshHost,
-          sshUser,
-          `tail -n +${lineCount + 1} ${logPath}`,
-        );
+        const list = await queryPlayers(g);
+        if (!list) {
+          context.logger.warning(
+            "Could not parse player list; reporting 0 online",
+            {},
+          );
+        }
+        const data = {
+          serverRunning: true,
+          online: list?.online ?? 0,
+          max: list?.max ?? null,
+          players: list?.players ?? [],
+        };
+        context.logger.info("{online}/{max} players: {players}", {
+          online: data.online,
+          max: data.max ?? "?",
+          players: data.players.join(", ") || "(none)",
+        });
 
-        const match = tailResult.stdout.match(
-          /There are (\d+) of a max of (\d+) players online:(.*)/,
-        );
-        const online = match ? parseInt(match[1], 10) : 0;
-        const max = match ? parseInt(match[2], 10) : null;
-        const playerStr = match ? match[3].trim() : "";
-        const players = playerStr
-          ? playerStr.split(",").map((p) => p.trim()).filter(Boolean)
-          : [];
-
-        console.log(
-          `[collectMetrics] ${online}/${max ?? "?"} players: ${
-            players.join(", ") || "(none)"
-          }`,
-        );
-
-        const data = { serverRunning: true, online, max, players };
         await writeMetricsFiles(
           sshHost,
-          sshUser,
+          g.sshUser,
           "minecraft",
           serverName,
           data,
         );
-
-        const handle = await context.writeResource("metrics", serverName, {
-          ...data,
-          timestamp: new Date().toISOString(),
-        });
-        return { dataHandles: [handle] };
+        return await writeMetrics(data);
       },
     },
   },

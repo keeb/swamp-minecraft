@@ -1,10 +1,17 @@
 // Image → Minecraft block art helpers for the drawImage method.
-// No type annotations here: lib/ files are loaded as potential models.
-import pngjs from "npm:pngjs@7.0.0";
-import { Buffer } from "node:buffer";
+import { decodePng } from "./png.ts";
+
+/** A cardinal direction a viewer can face. */
+export type Facing = "north" | "south" | "east" | "west";
+
+/** Block grid: grid[row][col] is a block id, or null for "leave untouched". */
+export type BlockGrid = (string | null)[][];
+
+/** Hard cap on art height in blocks (keeps memory and command count sane). */
+export const MAX_ART_HEIGHT = 2048;
 
 // Average texture colors of solid, non-gravity, non-valuable blocks.
-const PALETTE = [
+const PALETTE: [string, number, number, number][] = [
   ["white_concrete", 207, 213, 214],
   ["orange_concrete", 224, 97, 1],
   ["magenta_concrete", 169, 48, 159],
@@ -56,8 +63,8 @@ const PALETTE = [
   ["black_terracotta", 37, 23, 16],
 ];
 
-function srgbToLab(r, g, b) {
-  const lin = (c) => {
+function srgbToLab(r: number, g: number, b: number): [number, number, number] {
+  const lin = (c: number) => {
     c /= 255;
     return c <= 0.04045 ? c / 12.92 : Math.pow((c + 0.055) / 1.055, 2.4);
   };
@@ -65,16 +72,17 @@ function srgbToLab(r, g, b) {
   const x = (R * 0.4124 + G * 0.3576 + B * 0.1805) / 0.95047;
   const y = R * 0.2126 + G * 0.7152 + B * 0.0722;
   const z = (R * 0.0193 + G * 0.1192 + B * 0.9505) / 1.08883;
-  const f = (t) => t > 0.008856 ? Math.cbrt(t) : 7.787 * t + 16 / 116;
+  const f = (t: number) => t > 0.008856 ? Math.cbrt(t) : 7.787 * t + 16 / 116;
   const fx = f(x), fy = f(y), fz = f(z);
   return [116 * fy - 16, 500 * (fx - fy), 200 * (fy - fz)];
 }
 
-const PALETTE_LAB = PALETTE.map((
+const PALETTE_LAB: [string, [number, number, number]][] = PALETTE.map((
   [name, r, g, b],
 ) => [name, srgbToLab(r, g, b)]);
 
-function nearestBlock(r, g, b) {
+/** Nearest palette block (CIELAB distance) for an sRGB colour. */
+export function nearestBlock(r: number, g: number, b: number): string {
   const [L, A, B] = srgbToLab(r, g, b);
   let best = PALETTE_LAB[0][0];
   let bestD = Infinity;
@@ -93,15 +101,24 @@ function nearestBlock(r, g, b) {
  * Returns { width, height, grid } where grid[row][col] is a block id or null
  * (transparent: average alpha below alphaThreshold). Row 0 is the image top.
  */
-export function imageToBlockGrid(pngBytes, width, alphaThreshold = 128) {
-  const png = pngjs.PNG.sync.read(Buffer.from(pngBytes));
+export async function imageToBlockGrid(
+  pngBytes: Uint8Array,
+  width: number,
+  alphaThreshold = 128,
+): Promise<{ width: number; height: number; grid: BlockGrid }> {
+  const png = await decodePng(pngBytes);
   const srcW = png.width, srcH = png.height, data = png.data;
   const height = Math.max(1, Math.round(srcH * width / srcW));
-  const grid = [];
+  if (height > MAX_ART_HEIGHT) {
+    throw new Error(
+      `Art would be ${height} blocks tall (max ${MAX_ART_HEIGHT}); use a smaller width`,
+    );
+  }
+  const grid: BlockGrid = [];
   for (let row = 0; row < height; row++) {
     const y0 = Math.floor(row * srcH / height);
     const y1 = Math.max(y0 + 1, Math.floor((row + 1) * srcH / height));
-    const line = [];
+    const line: (string | null)[] = [];
     for (let col = 0; col < width; col++) {
       const x0 = Math.floor(col * srcW / width);
       const x1 = Math.max(x0 + 1, Math.floor((col + 1) * srcW / width));
@@ -117,7 +134,7 @@ export function imageToBlockGrid(pngBytes, width, alphaThreshold = 128) {
           n++;
         }
       }
-      if (a / n < alphaThreshold) {
+      if (a === 0 || a / n < alphaThreshold) {
         line.push(null);
       } else {
         line.push(nearestBlock(r / a, g / a, b / a));
@@ -129,7 +146,7 @@ export function imageToBlockGrid(pngBytes, width, alphaThreshold = 128) {
 }
 
 // Unit vectors for a viewer standing at the anchor looking toward `facing`.
-const AXES = {
+const AXES: Record<Facing, { fwd: number[]; right: number[] }> = {
   north: { fwd: [0, 0, -1], right: [1, 0, 0] },
   south: { fwd: [0, 0, 1], right: [-1, 0, 0] },
   east: { fwd: [1, 0, 0], right: [0, 0, 1] },
@@ -137,9 +154,9 @@ const AXES = {
 };
 
 /** Snap a Minecraft yaw (0=south, 90=west, 180=north, -90=east) to a cardinal. */
-export function yawToFacing(yaw) {
+export function yawToFacing(yaw: number): Facing {
   const y = ((Math.round(yaw / 90) % 4) + 4) % 4;
-  return ["south", "west", "north", "east"][y];
+  return (["south", "west", "north", "east"] as const)[y];
 }
 
 /**
@@ -149,14 +166,25 @@ export function yawToFacing(yaw) {
  * floor: flat at anchor y-1, starting `distance` blocks ahead, image top
  *        farthest away, readable when facing `facing`.
  */
-export function gridToCommands(grid, anchor, facing, orientation, distance) {
+export function gridToCommands(
+  grid: BlockGrid,
+  anchor: number[],
+  facing: Facing,
+  orientation: "wall" | "floor",
+  distance: number,
+): {
+  commands: string[];
+  counts: Record<string, number>;
+  blocks: number;
+  corners: number[][];
+} {
   const { fwd, right } = AXES[facing];
   const width = grid[0].length, height = grid.length;
   const ax = Math.floor(anchor[0]),
     ay = Math.floor(anchor[1]),
     az = Math.floor(anchor[2]);
   const half = Math.floor(width / 2);
-  const pos = (col, row) => {
+  const pos = (col: number, row: number): number[] => {
     const c = col - half;
     if (orientation === "floor") {
       const f = distance + (height - 1 - row);
@@ -172,8 +200,8 @@ export function gridToCommands(grid, anchor, facing, orientation, distance) {
       az + fwd[2] * distance + right[2] * c,
     ];
   };
-  const commands = [];
-  const counts = {};
+  const commands: string[] = [];
+  const counts: Record<string, number> = {};
   let blocks = 0;
   for (let row = 0; row < height; row++) {
     let col = 0;

@@ -1,12 +1,34 @@
 // Shared helpers for game server metrics collection.
 // Formats Prometheus textfile metrics and JSON log lines, writes via SSH.
 
-import { sshExec } from "./ssh.ts";
+import { shellQuote, sshExec } from "./ssh.ts";
 
-// PlayerData shape: { online, max, players, serverRunning }
+/** Player data written to the textfile collector and the JSON log. */
+export interface PlayerData {
+  serverRunning: boolean;
+  online: number;
+  max: number | null;
+  players: string[];
+}
 
-export function formatPromMetrics(gameType, serverName, data) {
-  const labels = `game="${gameType}",server="${serverName}"`;
+/** Escape a Prometheus label value (backslash, double quote, newline). */
+export function escapeLabel(value: string): string {
+  return value.replace(/\\/g, "\\\\").replace(/"/g, '\\"').replace(
+    /\n/g,
+    "\\n",
+  );
+}
+
+/** Render Prometheus textfile-collector metrics for one server. */
+export function formatPromMetrics(
+  gameType: string,
+  serverName: string,
+  data: PlayerData,
+  now: number = Date.now(),
+): string {
+  const labels = `game="${escapeLabel(gameType)}",server="${
+    escapeLabel(serverName)
+  }"`;
   const running = data.serverRunning ? 1 : 0;
   const lines = [
     `# HELP game_server_running Whether the game server process is running`,
@@ -26,14 +48,20 @@ export function formatPromMetrics(gameType, serverName, data) {
   lines.push(
     `# HELP game_metrics_collected_at Unix timestamp of last successful collection`,
     `# TYPE game_metrics_collected_at gauge`,
-    `game_metrics_collected_at{${labels}} ${Math.floor(Date.now() / 1000)}`,
+    `game_metrics_collected_at{${labels}} ${Math.floor(now / 1000)}`,
   );
   return lines.join("\n") + "\n";
 }
 
-export function formatLogLine(gameType, serverName, data) {
+/** Render one JSON log line (picked up by promtail). */
+export function formatLogLine(
+  gameType: string,
+  serverName: string,
+  data: PlayerData,
+  now: Date = new Date(),
+): string {
   return JSON.stringify({
-    ts: new Date().toISOString(),
+    ts: now.toISOString(),
     game: gameType,
     server: serverName,
     running: data.serverRunning,
@@ -43,31 +71,39 @@ export function formatLogLine(gameType, serverName, data) {
   });
 }
 
-export async function writeMetricsFiles(
-  sshHost,
-  sshUser,
-  gameType,
-  serverName,
-  data,
-) {
-  const promContent = formatPromMetrics(gameType, serverName, data);
-  const logLine = formatLogLine(gameType, serverName, data);
-
+/** Build the remote shell command that atomically writes both files. */
+export function buildMetricsCommand(
+  gameType: string,
+  promContent: string,
+  logLine: string,
+): string {
+  if (!/^[a-z0-9_]+$/.test(gameType)) {
+    throw new Error(`Invalid gameType "${gameType}"`);
+  }
   const promDir = "/var/lib/node_exporter/textfile_collector";
   const promFile = `${promDir}/game_${gameType}.prom`;
   const logFile = "/var/log/game-players.log";
+  // Atomic write: tmp then mv (prevents partial reads by node-exporter).
+  return `mkdir -p ${promDir} && printf '%s' ${
+    shellQuote(promContent)
+  } > ${promFile}.tmp && mv ${promFile}.tmp ${promFile} && printf '%s\\n' ${
+    shellQuote(logLine)
+  } >> ${logFile}`;
+}
 
-  // Atomic write: tmp → mv (prevents partial reads by node-exporter)
+/** Write the Prometheus textfile and append the JSON log line over ssh. */
+export async function writeMetricsFiles(
+  sshHost: string,
+  sshUser: string,
+  gameType: string,
+  serverName: string,
+  data: PlayerData,
+): Promise<void> {
+  const promContent = formatPromMetrics(gameType, serverName, data);
+  const logLine = formatLogLine(gameType, serverName, data);
   await sshExec(
     sshHost,
     sshUser,
-    `mkdir -p ${promDir} && cat > ${promFile}.tmp << 'PROMEOF'\n${promContent}PROMEOF\nmv ${promFile}.tmp ${promFile}`,
-  );
-
-  // Append JSON log line (promtail picks it up)
-  await sshExec(
-    sshHost,
-    sshUser,
-    `echo '${logLine.replace(/'/g, "'\\''")}' >> ${logFile}`,
+    buildMetricsCommand(gameType, promContent, logLine),
   );
 }

@@ -66,7 +66,7 @@ jobs:
           methodName: upload
           inputs:
             vmName: '${{ inputs.vmName }}'
-            serverPackPath: '${{ inputs.serverPackPath }}'
+            localPath: '${{ inputs.serverPackPath }}'
         dependsOn:
           - step: lookup-vm
             condition:
@@ -81,6 +81,7 @@ jobs:
           inputs:
             vmName: '${{ inputs.vmName }}'
             serverDir: '${{ inputs.serverDir }}'
+            remotePath: ~/server-pack.zip
         dependsOn:
           - step: install-deps
             condition:
@@ -97,6 +98,7 @@ jobs:
           methodName: configure
           inputs:
             vmName: '${{ inputs.vmName }}'
+            serverDir: '${{ inputs.serverDir }}'
             jvmMemory: '${{ inputs.jvmMemory }}'
         dependsOn:
           - step: extract-pack

@@ -1,6 +1,6 @@
 ---
 name: minecraft
-description: Control Minecraft servers via swamp — start, stop, reboot, query status, broadcast chat, op/deop players, install modpacks from server-pack zips, and collect player metrics for Prometheus. Provides the `@user/minecraft/server` and `@user/minecraft/installer` model types from the `@keeb/minecraft` extension. Use when the user mentions Minecraft, modded Minecraft (NeoForge/Forge/Fabric), tmux-managed game servers over SSH, server packs, EULA setup, JVM memory tuning for game servers, in-game broadcasts (`say`), op/deop, player counts, or game metrics for Prometheus textfile collector. Triggers on phrases like "start minecraft", "stop the mc server", "reboot minecraft", "minecraft player count", "install a modpack", "broadcast to minecraft", "op a player", "minecraft metrics".
+description: Control Minecraft servers via swamp — start, stop, reboot, query status, broadcast chat, op/deop players, install modpacks from server-pack zips, and collect player metrics for Prometheus. Provides the `@keeb/minecraft/server` and `@keeb/minecraft/installer` model types from the `@keeb/minecraft` extension. Use when the user mentions Minecraft, modded Minecraft (NeoForge/Forge/Fabric), tmux-managed game servers over SSH, server packs, EULA setup, JVM memory tuning for game servers, in-game broadcasts (`say`), op/deop, player counts, or game metrics for Prometheus textfile collector. Triggers on phrases like "start minecraft", "stop the mc server", "reboot minecraft", "minecraft player count", "install a modpack", "broadcast to minecraft", "op a player", "minecraft metrics".
 ---
 
 # minecraft
@@ -12,7 +12,7 @@ and collects player metrics. It depends on `@keeb/proxmox` for VM lifecycle and
 
 ## Models
 
-### `@user/minecraft/server`
+### `@keeb/minecraft/server`
 
 Operate a running (or expected-to-be-running) Minecraft server over SSH+tmux.
 
@@ -35,7 +35,7 @@ Methods:
 | Method                 | Args                         | Notes                                                                                                                                                                                                          |
 | ---------------------- | ---------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `say`                  | `message: string` (required) | Sends `say <msg>` via `tmux send-keys`. No-ops (skipped) when sshHost missing or tmux session absent.                                                                                                          |
-| `op`                   | `playerName: string`         | Sanitizes to `[a-zA-Z0-9_]`. Same skip behavior as `say`.                                                                                                                                                      |
+| `op`                   | `playerName: string`         | Rejects names outside `[A-Za-z0-9_]{1,16}`. Same skip behavior as `say`.                                                                                                                                       |
 | `deop`                 | `playerName: string`         | Same as `op`.                                                                                                                                                                                                  |
 | `warnShutdown`         | none                         | Broadcasts shutdown warning 3x and sleeps 30s. Skips cleanly if sshHost/tmux missing.                                                                                                                          |
 | `startMinecraftServer` | none                         | Waits for SSH, kills stale tmux, truncates log, starts via `tmux new-session ... bash <startScript>`. Polls log for `]: Done (` for up to **15 minutes** (NeoForge boots are slow). Throws if tmux dies early. |
@@ -43,7 +43,7 @@ Methods:
 | `status`               | none                         | Sends `list` to console, tails new log lines, parses `There are N of a max of M players online: ...`. Writes `serverRunning`, `online`, `max`, `players`.                                                      |
 | `collectMetrics`       | none                         | Like `status` but also writes Prometheus textfile + JSON via `writeMetricsFiles` to the **resource named `metrics`** (not `server`). Returns zeros when SSH/tmux unreachable rather than failing.              |
 
-### `@user/minecraft/installer`
+### `@keeb/minecraft/installer`
 
 Install a Minecraft server pack on a fresh VM.
 
@@ -86,7 +86,7 @@ gracefully no-op when a VM is stopped. Wire it from a `@keeb/proxmox` fleet
 lookup resource using a CEL expression in the model definition YAML, e.g.:
 
 ```yaml
-type: "@user/minecraft/server"
+type: "@keeb/minecraft/server"
 name: allthemonsMinecraft
 globalArguments:
   sshHost: ${{ resources.fleet.allthemons.ip }}
@@ -135,20 +135,26 @@ swamp model method allthemonsMinecraft op  --arg playerName=keeb
 - **15-minute start timeout.** `startMinecraftServer` polls for `]: Done (` for
   900 seconds. Modded packs (NeoForge install, mod loading) routinely take 5–10
   minutes the first time. Don't shorten this without good reason.
-- **`collectMetrics` writes to a different resource than `status`.** It writes
-  to `metrics`, not `server`. Query `metrics` when you want the time series of
-  player counts.
+- **`collectMetrics` and `status` share an instance name.** They write the
+  `metrics` and `server` specs respectively, but both use `serverName` as the
+  instance name, and swamp stores data by instance name, so they share one
+  version history (same shape). `drawImage` writes its own
+  `drawing-<name>` instance per drawing function.
 - **Server resource is gc'd at 10 versions, metrics at 10, installer at 5.** Old
   data ages out — don't rely on long history.
-- **Player name sanitization.** `op`/`deop` strip everything outside
-  `[a-zA-Z0-9_]`. Bedrock-style names with spaces or punctuation will be
-  mangled.
+- **Player name validation.** `op`/`deop`/`drawImage anchorPlayer` reject
+  anything outside `[A-Za-z0-9_]{1,16}` (Java edition names) instead of
+  silently rewriting it.
+- **Argument validation.** `tmuxSession`, `serverDir`, `logPath`,
+  `startScript` and installer paths may not contain spaces or shell
+  metacharacters; invalid values fail the `valid-server-target` /
+  `valid-ssh-target` pre-flight check.
 - **Restart-loop defeat.** `stopMinecraftServer` deliberately
   `tmux kill-session`s after the java PID exits — pack start scripts that
   auto-respawn would otherwise restart the server.
 - **NeoForge PID tracking.** `stopMinecraftServer` first tries
-  `pgrep -f 'java.*neoforge'` and falls back to `pgrep -f java`. Mixed-purpose
-  hosts running other JVMs may confuse the wait loop.
+  `pgrep -f '[j]ava.*neoforge'` and falls back to `pgrep -f '[j]ava'`.
+  Mixed-purpose hosts running other JVMs may confuse the wait loop.
 - **`sshHost` is nullable on the server model but required on the installer
   model.** The server methods skip cleanly when null; the installer methods
   throw.
